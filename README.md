@@ -53,7 +53,6 @@ Save (Ctrl+S) or open a tournament as JSON at any point to pause and resume it.
 |---|---|
 | `play_rounds` | A win is counted only if a player has **exactly 3** sets. A best-of-3 result `2-1` gives nobody the win, and `3-3` or `5-0` are accepted. |
 | `play_rounds` / `play_knockout_match` | There is no input validation. `int(input())` crashes on typos, and a tied score in a knockout gives the win to player 2. |
-| `rank_players` (2-way tie) | `get_h2h_winner_and_loser` is used, which is fine. |
 | `rank_players` (≥3 tied) | Sorting by set diff and then making one pass of **adjacent swaps** gives the wrong order. For example, with diffs A=B=C, swapping A/B and then B/C can never compare A with C, and the result depends on the starting order. Circular ties (A>B>C>A) get an arbitrary result. |
 | `rank_players` | Head-to-head is checked with `p1, p2` order fallbacks, but if the players never met (e.g. extended formats) it raises `KeyError`. |
 | `create_matchup` | Hard-coded for 3/4/5 players. The 3-player and 4/5-player branches also return different shapes (list vs tuple of pairs). |
