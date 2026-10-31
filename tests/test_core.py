@@ -5,7 +5,7 @@ from pathlib import Path
 
 from tennis.core import (Match, MatchFormat, Score, ScoreError, Tournament, TournamentError,
                          compute_standings, get_h2h_winner_and_loser, parse_score,
-                         round_robin, tally)
+                         playoff_pairs, round_robin, tally)
 from tennis.core import persistence
 
 
@@ -170,33 +170,58 @@ class TieBreakTests(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Tournament flow
 # --------------------------------------------------------------------------- #
+def make(groups, advance=2, group_formats=None, playoff_fmt=None):
+    return Tournament.create("T", groups, group_formats, playoff_fmt, advance)
+
+
+def play_groups(t):
+    """Enter a valid score for every group match (player 1 always wins)."""
+    for g in t.groups:
+        w, lo = g.fmt.valid_results()[0]
+        for m in g.matches:
+            t.record_score(m.id, f"{w}-{lo}")
+
+
+def play_bracket(t, text="6-1"):
+    ko = t.knockout
+    for _name, ids in ko.rounds:
+        for mid in ids + (["3P"] if "3P" in ko.matches and ids == ["F"] else []):
+            t.record_score(mid, text)
+
+
+def players(prefix, n):
+    return [f"{prefix}{i}" for i in range(1, n + 1)]
+
+
 class FlowTests(unittest.TestCase):
     def test_full_flow_and_persistence(self):
-        t = Tournament.create("Cup", {"A": ["a1", "a2", "a3"], "B": ["b1", "b2", "b3", "b4", "b5"]},
-                              MatchFormat(6, True), {"B": MatchFormat(3, False)})
+        t = make({"A": players("a", 3), "B": players("b", 5)},
+                 group_formats={"A": MatchFormat(6, True), "B": MatchFormat(3, False)},
+                 playoff_fmt=MatchFormat(2, True))
         a, b = t.groups
         self.assertEqual(t.format_for(a.matches[0].id), MatchFormat(6, True))
         self.assertEqual(t.format_for(b.matches[0].id), MatchFormat(3, False))
         with self.assertRaises(ScoreError):                 # 6-1 is not first-to-3
             t.record_score(b.matches[0].id, "6-1")
-        for m in a.matches:
-            t.record_score(m.id, "6-1")                     # p1 always wins
-        for m in b.matches:
-            t.record_score(m.id, "3-2")
+        play_groups(t)
         self.assertTrue(t.group_stage_complete)
         ko = t.start_playoffs()
+        self.assertEqual(t.format_for("SF1"), MatchFormat(2, True))
+        with self.assertRaises(ScoreError):                 # playoffs are first to 2
+            t.record_score("SF1", "6-1")
         sf1, sf2 = ko.matches["SF1"], ko.matches["SF2"]
-        t.record_score("SF1", "6-1")
-        t.record_score("SF2", "1-6")
-        self.assertEqual(ko.matches["F"].p1, sf1.p1)
-        self.assertEqual(ko.matches["F"].p2, sf2.p2)
-        t.record_score("F", "7-6")
-        t.record_score("3P", "7-5")
-        self.assertEqual(ko.podium[0], sf1.p1)
+        t.record_score("SF1", "3-2")
+        t.record_score("SF2", "1-3")
+        self.assertEqual((ko.matches["F"].p1, ko.matches["F"].p2), (sf1.p1, sf2.p2))
+        self.assertEqual((ko.matches["3P"].p1, ko.matches["3P"].p2), (sf1.p2, sf2.p1))
+        t.record_score("F", "2-0")
+        t.record_score("3P", "3-1")
+        self.assertEqual(ko.podium, (sf1.p1, sf2.p2, sf1.p2))
         with self.assertRaises(TournamentError):            # group stage locked
             t.record_score(a.matches[0].id, "6-0")
-        t.record_score("SF1", "1-6")                        # changing a semi clears the final
+        t.record_score("SF1", "1-3")                        # changing a semi clears the final
         self.assertIsNone(ko.matches["F"].score)
+        self.assertIsNone(ko.podium)
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "t.json"
             persistence.save(t, p)
@@ -204,7 +229,7 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(t2.to_dict(), t.to_dict())
 
     def test_rounds_must_be_completed_in_order(self):
-        t = Tournament.create("T", {"G": ["A", "B", "C", "D"]})
+        t = make({"G": ["A", "B", "C", "D"]})
         g = t.groups[0]
         r1, r2 = g.matches_in_round(1), g.matches_in_round(2)
         self.assertFalse(t.is_editable(r2[0].id))
@@ -220,9 +245,8 @@ class FlowTests(unittest.TestCase):
             t.start_playoffs()
 
     def test_old_save_files_are_rejected(self):
-        t = Tournament.create("T", {"G": ["A", "B", "C", "D"]})
-        d = t.to_dict()
-        d["version"] = 1
+        d = make({"G": ["A", "B", "C", "D"]}).to_dict()
+        d["version"] = 2
         with self.assertRaises(TournamentError):
             Tournament.from_dict(d)
 
@@ -230,15 +254,122 @@ class FlowTests(unittest.TestCase):
         bad = [
             {"A": ["a", "b"]},                                  # too few
             {"A": ["a", "b", "c", "d", "e", "f"]},              # too many
-            {"A": ["a", "b", "c"]},                             # 1 group needs 4+
             {"A": ["a", "b", "c"], "B": ["A", "d", "e"]},       # duplicate name
             {"A": ["a", "b", "c"], "B": ["d", "e", "f"], "C": ["g", "h", "i"]},  # 3 groups
         ]
         for groups in bad:
             with self.subTest(groups=groups), self.assertRaises(TournamentError):
-                Tournament.create("x", groups)
+                make(groups)
         for n in (3, 4, 5):
-            Tournament.create("x", {"A": list("abcde")[:n], "B": list("fghij")[:n]})
+            make({"A": players("a", n)})
+            make({"A": players("a", n), "B": players("b", n)})
+
+
+# --------------------------------------------------------------------------- #
+# Playoff qualification and bracket sizes
+# --------------------------------------------------------------------------- #
+def ranked(*prefixes, n=5):
+    return [players(p, n) for p in prefixes]
+
+
+class QualificationTests(unittest.TestCase):
+    def test_advance_options(self):
+        opts = Tournament.advance_options
+        self.assertEqual(opts([5]), [2])                     # 1 group: always the Final
+        self.assertEqual(opts([5, 5]), [2, 4])
+        self.assertEqual(opts([5, 4]), [2])
+        self.assertEqual(opts([5, 5, 5, 5]), [2, 4])
+        self.assertEqual(opts([5, 5, 5, 3]), [2])
+
+    def test_top4_only_with_all_groups_of_five(self):
+        for groups in ({"A": players("a", 5)},
+                       {"A": players("a", 5), "B": players("b", 4)},
+                       {g: players(g.lower(), 5 if g != "D" else 4) for g in "ABCD"}):
+            with self.subTest(groups=groups), self.assertRaises(TournamentError):
+                make(groups, advance=4)
+
+    def test_pairs(self):
+        self.assertEqual(playoff_pairs(ranked("A", n=3), 2), [("A1", "A2")])
+        self.assertEqual(playoff_pairs(ranked("A", "B"), 2), [("A1", "B2"), ("B1", "A2")])
+        self.assertEqual(playoff_pairs(ranked("A", "B"), 4),
+                         [("A1", "B4"), ("B2", "A3"), ("B1", "A4"), ("A2", "B3")])
+        self.assertEqual(playoff_pairs(ranked("A", "B", "C", "D", n=3), 2),
+                         [("A1", "B2"), ("C1", "D2"), ("B1", "A2"), ("D1", "C2")])
+
+    def test_round_of_16_keeps_group_mates_apart(self):
+        pairs = playoff_pairs(ranked("A", "B", "C", "D"), 4)
+        flat = [p for pair in pairs for p in pair]
+        self.assertEqual(sorted(flat), sorted(f"{g}{i}" for g in "ABCD" for i in range(1, 5)))
+        for a, b in pairs:                       # 1st v 4th and 2nd v 3rd, different groups
+            self.assertNotEqual(a[0], b[0])
+            self.assertEqual(int(a[1]) + int(b[1]), 5)
+        quarter = {p: i // 4 for i, p in enumerate(flat)}
+        for g in "ABCD":
+            self.assertEqual(len({quarter[f"{g}{i}"] for i in range(1, 5)}), 4)
+            self.assertNotEqual(quarter[f"{g}1"] // 2, quarter[f"{g}2"] // 2)   # other half
+
+    def test_bracket_shapes(self):
+        cases = [  # groups, advance, size, round names
+            ({"A": players("a", 3)}, 2, 2, ["Final"]),
+            ({"A": players("a", 5)}, 2, 2, ["Final"]),
+            ({"A": players("a", 4), "B": players("b", 3)}, 2, 4, ["Semi-Finals", "Final"]),
+            ({"A": players("a", 5), "B": players("b", 5)}, 2, 4, ["Semi-Finals", "Final"]),
+            ({"A": players("a", 5), "B": players("b", 5)}, 4, 8,
+             ["Quarter-Finals", "Semi-Finals", "Final"]),
+            ({g: players(g.lower(), 3) for g in "ABCD"}, 2, 8,
+             ["Quarter-Finals", "Semi-Finals", "Final"]),
+            ({g: players(g.lower(), 5) for g in "ABCD"}, 4, 16,
+             ["Round of 16", "Quarter-Finals", "Semi-Finals", "Final"]),
+        ]
+        for groups, adv, size, names in cases:
+            with self.subTest(groups=list(map(len, groups.values())), advance=adv):
+                t = make(groups, advance=adv)
+                self.assertEqual(t.playoff_size, size)
+                play_groups(t)
+                ko = t.start_playoffs()
+                self.assertEqual(ko.size, size)
+                self.assertEqual([n for n, _ in ko.rounds], names)
+                first = ko.rounds[0][1]
+                self.assertEqual(len(first), size // 2)
+                self.assertTrue(all(ko.matches[m].is_ready for m in first))
+                self.assertEqual("3P" in ko.matches, size >= 4)
+                play_bracket(t)
+                champ, runner, third = ko.podium
+                self.assertEqual(champ, ko.matches["F"].winner)
+                if size == 2:
+                    self.assertIsNone(third)
+                    standings = [r.name for r in t.groups[0].standings()]
+                    self.assertEqual({champ, runner}, set(standings[:2]))
+                else:
+                    self.assertEqual(third, ko.matches["3P"].winner)
+
+    def test_round_of_16_progression_and_reset(self):
+        t = make({g: players(g.lower(), 5) for g in "ABCD"}, advance=4)
+        play_groups(t)
+        ko = t.start_playoffs()
+        play_bracket(t)                           # player 1 always wins
+        r16 = [ko.matches[f"R16-{j}"] for j in range(1, 9)]
+        qf = [ko.matches[f"QF{j}"] for j in range(1, 5)]
+        for j, m in enumerate(qf):
+            self.assertEqual((m.p1, m.p2), (r16[2 * j].winner, r16[2 * j + 1].winner))
+        self.assertEqual(ko.matches["F"].p1, ko.matches["SF1"].winner)
+        t.record_score("R16-1", "1-6")            # upset in the first match
+        self.assertEqual(qf[0].p1, r16[0].p2)
+        for mid in ("QF1", "SF1", "F", "3P"):     # everything downstream is reset
+            self.assertIsNone(ko.matches[mid].score, mid)
+        self.assertIsNotNone(ko.matches["QF2"].score)   # other half untouched
+        self.assertIsNone(ko.podium)
+        with self.assertRaises(TournamentError):  # SF1 has no players yet
+            t.record_score("SF1", "6-1")
+
+    def test_quarter_final_bracket_persists(self):
+        t = make({"A": players("a", 5), "B": players("b", 5)}, advance=4)
+        play_groups(t)
+        t.start_playoffs()
+        t.record_score("QF1", "6-2")
+        d = t.to_dict()
+        self.assertEqual(Tournament.from_dict(d).to_dict(), d)
+        self.assertEqual(Tournament.from_dict(d).knockout.size, 8)
 
 
 if __name__ == "__main__":

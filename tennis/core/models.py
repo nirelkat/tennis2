@@ -58,11 +58,12 @@ class Group:
     players: list[str]
     matches: list[Match] = field(default_factory=list)
     resting: dict[int, list[str]] = field(default_factory=dict)
-    fmt: MatchFormat | None = None      # None = use the tournament's format
+    fmt: MatchFormat = field(default_factory=MatchFormat)
 
     @classmethod
     def create(cls, name: str, players: list[str], prefix: str,
                fmt: MatchFormat | None = None) -> "Group":
+        fmt = fmt or MatchFormat()
         g = cls(name, list(players), fmt=fmt)
         for rnd in round_robin(len(players)):
             for k, (a, b) in enumerate(rnd.pairs, 1):
@@ -100,78 +101,167 @@ class Group:
 
     def to_dict(self) -> dict:
         return {"name": self.name, "players": self.players,
-                "format": self.fmt.to_dict() if self.fmt else None,
+                "format": self.fmt.to_dict(),
                 "matches": [m.to_dict() for m in self.matches],
                 "resting": {str(k): v for k, v in self.resting.items()}}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Group":
-        f = d.get("format")
         return cls(d["name"], d["players"], [Match.from_dict(m) for m in d["matches"]],
                    {int(k): v for k, v in d.get("resting", {}).items()},
-                   MatchFormat.from_dict(f) if f else None)
+                   MatchFormat.from_dict(d["format"]))
+
+
+ROUND_NAMES = {16: "Round of 16", 8: "Quarter-Finals", 4: "Semi-Finals", 2: "Final"}
+_ROUND_PREFIX = {16: "R16-", 8: "QF", 4: "SF"}
+BRACKET_SIZES = (2, 4, 8, 16)
 
 
 @dataclass
 class Knockout:
-    """Four-player bracket: SF1, SF2 -> Final and 3rd-place match."""
+    """Single-elimination bracket for 2, 4, 8 or 16 players.
+
+    Match ids: R16-1..8, QF1..4, SF1..2, F, and 3P (3rd place, when there are
+    semi-finals). Match j of a round is fed by the winners of matches 2j-1 and
+    2j of the previous round; the 3rd-place match by the semi-final losers."""
+    size: int
     matches: dict[str, Match]
 
-    LABELS = {"SF1": "Semi-Final 1", "SF2": "Semi-Final 2",
-              "3P": "3rd Place Match", "F": "Grand Final"}
+    @staticmethod
+    def round_ids(size: int) -> list[list[str]]:
+        """Match ids per round, first round first (the 3rd-place match excluded)."""
+        out, n = [], size
+        while n >= 2:
+            k = n // 2
+            out.append(["F"] if n == 2 else [f"{_ROUND_PREFIX[n]}{j}" for j in range(1, k + 1)])
+            n //= 2
+        return out
 
     @classmethod
-    def create(cls, seeds: list[tuple[str, str]]) -> "Knockout":
-        (a, b), (c, d) = seeds
-        return cls({"SF1": Match("SF1", a, b), "SF2": Match("SF2", c, d),
-                    "3P": Match("3P", None, None), "F": Match("F", None, None)})
-
-    def refresh(self) -> None:
-        """Propagate semi-final results; drop results whose participants changed."""
-        sf1, sf2 = self.matches["SF1"], self.matches["SF2"]
-        for mid, attr in (("F", "winner"), ("3P", "loser")):
-            m = self.matches[mid]
-            new = (getattr(sf1, attr), getattr(sf2, attr))
-            if (m.p1, m.p2) != new:
-                m.p1, m.p2, m.score = *new, None
+    def create(cls, pairs: list[tuple[str, str]]) -> "Knockout":
+        size = 2 * len(pairs)
+        if size not in BRACKET_SIZES:
+            raise TournamentError(f"Unsupported bracket size {size}")
+        matches: dict[str, Match] = {}
+        for r, ids in enumerate(cls.round_ids(size), 1):
+            for j, mid in enumerate(ids):
+                p1, p2 = pairs[j] if r == 1 else (None, None)
+                matches[mid] = Match(mid, p1, p2, r)
+        if size >= 4:
+            matches["3P"] = Match("3P", None, None, matches["F"].round)
+        return cls(size, matches)
 
     @property
-    def podium(self) -> tuple[str, str, str] | None:
-        f, t = self.matches["F"], self.matches["3P"]
-        if f.is_played and t.is_played:
-            return f.winner, f.loser, t.winner
-        return None
+    def rounds(self) -> list[tuple[str, list[str]]]:
+        """[(round name, [match ids])], e.g. [("Semi-Finals", ["SF1", "SF2"]), ("Final", ["F"])]."""
+        return [(ROUND_NAMES[len(ids) * 2], ids) for ids in self.round_ids(self.size)]
+
+    @staticmethod
+    def label(mid: str) -> str:
+        if mid == "F":
+            return "Final"
+        if mid == "3P":
+            return "3rd Place Match"
+        if mid.startswith("R16-"):
+            return f"Round of 16 · Match {mid[4:]}"
+        return {"QF": "Quarter-Final ", "SF": "Semi-Final "}[mid[:2]] + mid[2:]
+
+    def refresh(self) -> None:
+        """Move winners (and semi-final losers) forward, round by round. A
+        result is dropped if the players of that match changed."""
+        rounds = self.round_ids(self.size)
+        for prev, cur in zip(rounds, rounds[1:]):
+            for j, mid in enumerate(cur):
+                a, b = self.matches[prev[2 * j]], self.matches[prev[2 * j + 1]]
+                self._set_players(self.matches[mid], a.winner, b.winner)
+        if "3P" in self.matches:
+            sf1, sf2 = self.matches["SF1"], self.matches["SF2"]
+            self._set_players(self.matches["3P"], sf1.loser, sf2.loser)
+
+    @staticmethod
+    def _set_players(m: Match, p1: str | None, p2: str | None) -> None:
+        if (m.p1, m.p2) != (p1, p2):
+            m.p1, m.p2, m.score = p1, p2, None
+
+    @property
+    def is_complete(self) -> bool:
+        return all(m.is_played for m in self.matches.values())
+
+    @property
+    def podium(self) -> tuple[str, str, str | None] | None:
+        """(champion, runner-up, 3rd place or None when there is no 3rd-place match)."""
+        if not self.is_complete:
+            return None
+        f, t = self.matches["F"], self.matches.get("3P")
+        return f.winner, f.loser, (t.winner if t else None)
 
     def to_dict(self) -> dict:
-        return {k: m.to_dict() for k, m in self.matches.items()}
+        return {"size": self.size, "matches": [m.to_dict() for m in self.matches.values()]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Knockout":
-        return cls({k: Match.from_dict(m) for k, m in d.items()})
+        return cls(d["size"], {m["id"]: Match.from_dict(m) for m in d["matches"]})
+
+
+def playoff_pairs(standings: list[list[str]], advance: int) -> list[tuple[str, str]]:
+    """First-round playoff pairs from each group's final ranking.
+
+    standings: per group, player names in rank order. advance: players per
+    group that qualify. Pairs are listed in bracket order (pairs 1+2 meet in
+    the next round, 3+4, ...), arranged so players from the same group are in
+    different halves and only meet as late as possible."""
+    n = len(standings)
+    if n == 1:                                   # top 2 -> Final
+        g = standings[0]
+        return [(g[0], g[1])]
+    A, B = standings[0], standings[1]
+    if n == 2 and advance == 2:                  # Semi-Finals
+        return [(A[0], B[1]), (B[0], A[1])]
+    if n == 2 and advance == 4:                  # Quarter-Finals
+        return [(A[0], B[3]), (B[1], A[2]),      # -> SF1
+                (B[0], A[3]), (A[1], B[2])]      # -> SF2
+    C, D = standings[2], standings[3]
+    if advance == 2:                             # Quarter-Finals
+        return [(A[0], B[1]), (C[0], D[1]),      # -> SF1
+                (B[0], A[1]), (D[0], C[1])]      # -> SF2
+    return [(A[0], B[3]), (D[1], C[2]),          # Round of 16, quarter 1
+            (C[0], D[3]), (B[1], A[2]),          #              quarter 2
+            (B[0], A[3]), (C[1], D[2]),          #              quarter 3
+            (D[0], C[3]), (A[1], B[2])]          #              quarter 4
 
 
 @dataclass
 class Tournament:
     name: str
-    fmt: MatchFormat
+    playoff_fmt: MatchFormat
     groups: list[Group]
+    advance: int = 2                     # players per group who reach the playoffs
     knockout: Knockout | None = None
 
     MIN_GROUP, MAX_GROUP = 3, 5          # as in the original script
-    FILE_VERSION = 2
+    FILE_VERSION = 3
+
+    @staticmethod
+    def advance_options(group_sizes: list[int]) -> list[int]:
+        """Allowed players-per-group to qualify. Top 4 is only offered when
+        there are 2 or 4 groups and every group has exactly 5 players."""
+        if len(group_sizes) in (2, 4) and all(n == 5 for n in group_sizes):
+            return [2, 4]
+        return [2]
+
+    @staticmethod
+    def bracket_size(n_groups: int, advance: int) -> int:
+        return 2 if n_groups == 1 else n_groups * advance
 
     @classmethod
-    def create(cls, name: str, groups: dict[str, list[str]], fmt: MatchFormat | None = None,
-               group_formats: dict[str, MatchFormat | None] | None = None):
-        """groups: {group name: [player names]}.
-        fmt: format for the playoffs and every group without its own.
-        group_formats: optional {group name: format} overrides."""
+    def create(cls, name: str, groups: dict[str, list[str]],
+               group_formats: dict[str, MatchFormat] | None = None,
+               playoff_fmt: MatchFormat | None = None, advance: int = 2) -> "Tournament":
+        """groups: {group name: [player names]}; group_formats: {group name: format}
+        (missing groups use the default MatchFormat()); advance: 2 or 4."""
         group_formats = group_formats or {}
         if len(groups) not in (1, 2, 4):
-            raise TournamentError("Use 1, 2 or 4 groups (so exactly 4 players reach the playoffs)")
-        if len(groups) == 1 and len([p for p in next(iter(groups.values())) if p.strip()]) < 4:
-            raise TournamentError("With a single group, 4 or 5 players are needed "
-                                  "(the top 4 play the semi-finals)")
+            raise TournamentError("Use 1, 2 or 4 groups")
         seen: set[str] = set()
         built = []
         for i, (gname, players) in enumerate(groups.items()):
@@ -185,8 +275,19 @@ class Tournament:
                 raise TournamentError(f"Duplicate player name(s): {', '.join(sorted(dupes))}")
             seen.update(p.lower() for p in players)
             built.append(Group.create(gname.strip(), players, string.ascii_uppercase[i],
-                                      group_formats.get(gname)))
-        return cls(name or "Tournament", fmt or MatchFormat(), built)
+                                      group_formats.get(gname) or MatchFormat()))
+        if advance not in cls.advance_options([len(g.players) for g in built]):
+            raise TournamentError("Top 4 per group can only advance with 2 or 4 groups "
+                                  "of exactly 5 players each")
+        return cls(name or "Tournament", playoff_fmt or MatchFormat(), built, advance)
+
+    @property
+    def qualifiers_per_group(self) -> int:
+        return self.advance
+
+    @property
+    def playoff_size(self) -> int:
+        return self.bracket_size(len(self.groups), self.advance)
 
     # ---- lookups / commands -------------------------------------------------
     def all_matches(self) -> list[Match]:
@@ -209,7 +310,7 @@ class Tournament:
 
     def format_for(self, match_id: str) -> MatchFormat:
         g = self.group_of(match_id)
-        return g.fmt if g and g.fmt else self.fmt
+        return g.fmt if g else self.playoff_fmt
 
     def is_editable(self, match_id: str) -> bool:
         m = self.find_match(match_id)
@@ -243,13 +344,7 @@ class Tournament:
 
     def playoff_seeds(self) -> list[tuple[str, str]]:
         st = [[r.name for r in g.standings()] for g in self.groups]
-        if len(st) == 1:
-            s = st[0]
-            return [(s[0], s[3]), (s[1], s[2])]
-        if len(st) == 2:
-            a, b = st
-            return [(a[0], b[1]), (b[0], a[1])]
-        return [(st[0][0], st[3][0]), (st[1][0], st[2][0])]
+        return playoff_pairs(st, self.advance)
 
     def start_playoffs(self) -> Knockout:
         if not self.group_stage_complete:
@@ -263,16 +358,17 @@ class Tournament:
 
     # ---- serialization ---------------------------------------------------------
     def to_dict(self) -> dict:
-        return {"version": self.FILE_VERSION, "name": self.name, "format": self.fmt.to_dict(),
+        return {"version": self.FILE_VERSION, "name": self.name,
+                "playoff_format": self.playoff_fmt.to_dict(), "advance": self.advance,
                 "groups": [g.to_dict() for g in self.groups],
                 "knockout": self.knockout.to_dict() if self.knockout else None}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Tournament":
         if d.get("version") != cls.FILE_VERSION:
-            raise TournamentError("This file was saved by an older version with a different "
-                                  "scoring format and can't be opened")
+            raise TournamentError("This file was saved by an older version of the app "
+                                  "and can't be opened")
         ko = d.get("knockout")
-        return cls(d["name"], MatchFormat.from_dict(d["format"]),
-                   [Group.from_dict(g) for g in d["groups"]],
+        return cls(d["name"], MatchFormat.from_dict(d["playoff_format"]),
+                   [Group.from_dict(g) for g in d["groups"]], int(d.get("advance", 2)),
                    Knockout.from_dict(ko) if ko else None)

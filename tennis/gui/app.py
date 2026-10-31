@@ -6,8 +6,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import customtkinter as ctk
 
-from ..core import GAME_TARGETS, MatchFormat, ScoreError, TournamentError, parse_score
-from ..core.models import Knockout, Match
+from ..core import GAME_TARGETS, MatchFormat, ScoreError, Tournament, TournamentError, parse_score
+from ..core.models import ROUND_NAMES, Knockout, Match
 from .controller import TournamentController
 
 OK_COLOR, ERR_COLOR, MUTED = "#2fa572", "#d9534f", "gray60"
@@ -97,17 +97,48 @@ class ScoreRow(ctk.CTkFrame):
 
 
 # --------------------------------------------------------------------------- #
-class SetupView(ctk.CTkScrollableFrame):
-    DEFAULT = "Tournament format"
-    # per-group override choices -> MatchFormat (None = use the tournament format)
-    GROUP_CHOICES = {DEFAULT: None, **{
-        f"First to {n}" + (" + tie-break" if tb else ""): MatchFormat(n, tb)
-        for n in GAME_TARGETS for tb in (False, True)}}
+class FormatCard(ctk.CTkFrame):
+    """Match-format control: games to win [2][3][6], tie-break checkbox, valid scores."""
 
+    def __init__(self, master, title: str = "Match format", fmt: MatchFormat | None = None):
+        super().__init__(master, corner_radius=8, border_width=1, border_color=("gray75", "gray30"))
+        fmt = fmt or MatchFormat()
+        self.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(self, text=title, font=ctk.CTkFont(weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 2))
+        ctk.CTkLabel(self, text="Games to win").grid(row=1, column=0, sticky="w", padx=10)
+        self.games = ctk.CTkSegmentedButton(self, values=[str(n) for n in GAME_TARGETS],
+                                            command=lambda _v: self._update_hint())
+        self.games.set(str(fmt.games_to_win))
+        self.games.grid(row=1, column=1, sticky="w", padx=6, pady=2)
+        self.tiebreak = ctk.CTkCheckBox(self, text="Enable Tie-Break", command=self._update_hint)
+        if fmt.tiebreak:
+            self.tiebreak.select()
+        self.tiebreak.grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=2)
+        self.hint = ctk.CTkLabel(self, text="", text_color=MUTED, justify="left", anchor="w",
+                                 wraplength=320, font=ctk.CTkFont(size=11))
+        self.hint.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 6))
+        self._update_hint()
+
+    def get(self) -> MatchFormat:
+        return MatchFormat(int(self.games.get()), bool(self.tiebreak.get()))
+
+    def _update_hint(self) -> None:
+        fmt = self.get()
+        n = fmt.games_to_win
+        rule = (f"Win by two at {n - 1}-{n - 1}; deciding game at {n}-{n}."
+                if fmt.tiebreak else f"Sudden death: first to {n} wins.")
+        scores = ", ".join(f"{w}-{lo}" for w, lo in fmt.valid_results())
+        self.hint.configure(text=f"Valid scores: {scores}\n{rule}")
+
+
+class SetupView(ctk.CTkScrollableFrame):
     def __init__(self, master, app: "App"):
         super().__init__(master)
         self.app = app
-        self.group_frames: list[tuple[ctk.CTkEntry, ctk.CTkTextbox, ctk.CTkOptionMenu]] = []
+        # per group: (name entry, format card, players textbox, count label)
+        self.group_frames: list[tuple[ctk.CTkEntry, FormatCard, ctk.CTkTextbox, ctk.CTkLabel]] = []
+        self.advance_choices: dict[str, int] = {}
         ctk.CTkLabel(self, text="🎾 New Tournament", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(10, 4))
         top = ctk.CTkFrame(self)
         top.pack(fill="x", padx=20, pady=8)
@@ -120,21 +151,24 @@ class SetupView(ctk.CTkScrollableFrame):
         self.n_groups.set("2")
         self.n_groups.grid(row=0, column=3, padx=8, sticky="w")
 
-        ctk.CTkLabel(top, text="Games to win").grid(row=1, column=0, padx=8, pady=8, sticky="w")
-        self.games = ctk.CTkSegmentedButton(top, values=[str(n) for n in GAME_TARGETS],
-                                            command=lambda _: self._update_hint())
-        self.games.set("6")
-        self.games.grid(row=1, column=1, padx=8, sticky="w")
-        self.tiebreak = ctk.CTkCheckBox(top, text="Enable Tie-Break (Advantage / Deciding Game)",
-                                        command=self._update_hint)
-        self.tiebreak.select()
-        self.tiebreak.grid(row=1, column=2, columnspan=2, padx=8, sticky="w")
-        self.hint = ctk.CTkLabel(top, text="", text_color=MUTED, justify="left")
-        self.hint.grid(row=2, column=0, columnspan=4, padx=8, pady=(0, 8), sticky="w")
-        self._update_hint()
-
         self.groups_box = ctk.CTkFrame(self, fg_color="transparent")
         self.groups_box.pack(fill="both", expand=True, padx=20)
+
+        # ---- playoffs card
+        po = ctk.CTkFrame(self)
+        po.pack(fill="x", padx=28, pady=8)
+        po.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(po, text="🏆 Playoffs", font=ctk.CTkFont(size=16, weight="bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 4))
+        self.playoff_fmt = FormatCard(po, "Playoff Format")
+        self.playoff_fmt.grid(row=1, column=0, rowspan=3, sticky="nw", padx=10, pady=(0, 10))
+        ctk.CTkLabel(po, text="Qualification", font=ctk.CTkFont(weight="bold")).grid(
+            row=1, column=1, sticky="w", padx=10)
+        self.advance = ctk.CTkSegmentedButton(po, values=["-"], command=lambda _v: self._update_qualification())
+        self.advance.grid(row=2, column=1, sticky="w", padx=10)
+        self.qual_info = ctk.CTkLabel(po, text="", text_color=MUTED, justify="left", anchor="w")
+        self.qual_info.grid(row=3, column=1, sticky="nw", padx=10)
+
         self.error = ctk.CTkLabel(self, text="", text_color=ERR_COLOR)
         self.error.pack()
         bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -143,44 +177,84 @@ class SetupView(ctk.CTkScrollableFrame):
         ctk.CTkButton(bar, text="Create tournament ▶", command=self._create).pack(side="left", padx=6)
         self._rebuild("2")
 
-    def _format(self) -> MatchFormat:
-        return MatchFormat(int(self.games.get()), bool(self.tiebreak.get()))
-
-    def _update_hint(self) -> None:
-        fmt = self._format()
-        results = ", ".join(f"{w}-{lo}" for w, lo in fmt.valid_results())
-        n = fmt.games_to_win
-        rule = (f"At {n - 1}-{n - 1} win by two; at {n}-{n} one deciding tie-break game."
-                if fmt.tiebreak else f"Sudden death: the first player to {n} games wins.")
-        self.hint.configure(text=f"One set per match. {rule}\nValid results: {results}")
-
+    # ---- group cards ---------------------------------------------------------
     def _rebuild(self, n: str) -> None:
+        # keep what was already typed into the groups that remain
+        kept = [(e.get(), card.get(), tb.get("1.0", "end").strip()) for e, card, tb, _ in self.group_frames]
         for w in self.groups_box.winfo_children():
             w.destroy()
         self.group_frames.clear()
         for i in range(int(n)):
+            name, fmt, text = kept[i] if i < len(kept) else (f"Group {chr(65 + i)}", None, "")
             f = ctk.CTkFrame(self.groups_box)
             f.grid(row=i // 2, column=i % 2, padx=8, pady=8, sticky="nsew")
             self.groups_box.grid_columnconfigure(i % 2, weight=1)
-            e = ctk.CTkEntry(f)
-            e.insert(0, f"Group {chr(65 + i)}")
-            e.pack(fill="x", padx=10, pady=(10, 4))
-            fmt_menu = ctk.CTkOptionMenu(f, values=list(self.GROUP_CHOICES))
-            fmt_menu.set(self.DEFAULT)
-            fmt_menu.pack(fill="x", padx=10, pady=(0, 4))
-            hint = "4 or 5" if n == "1" else "3, 4 or 5"
-            ctk.CTkLabel(f, text=f"Players (one per line, {hint})", text_color=MUTED).pack(anchor="w", padx=10)
-            tb = ctk.CTkTextbox(f, height=130)
+            e = ctk.CTkEntry(f, font=ctk.CTkFont(weight="bold"))
+            e.insert(0, name)
+            e.pack(fill="x", padx=10, pady=(10, 6))
+            card = FormatCard(f, "Match format", fmt)
+            card.pack(fill="x", padx=10, pady=(0, 6))
+            count = ctk.CTkLabel(f, text="", text_color=MUTED, anchor="w")
+            count.pack(fill="x", padx=10)
+            tb = ctk.CTkTextbox(f, height=120)
+            if text:
+                tb.insert("1.0", text)
             tb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-            self.group_frames.append((e, tb, fmt_menu))
+            tb.bind("<KeyRelease>", lambda _e: self._players_changed())
+            self.group_frames.append((e, card, tb, count))
+        self._players_changed()
+
+    @staticmethod
+    def _players(tb: ctk.CTkTextbox) -> list[str]:
+        return [ln.strip() for ln in tb.get("1.0", "end").splitlines() if ln.strip()]
+
+    def _players_changed(self) -> None:
+        """Update the per-group player counts and the qualification options."""
+        for _e, _card, tb, count in self.group_frames:
+            k = len(self._players(tb))
+            ok = Tournament.MIN_GROUP <= k <= Tournament.MAX_GROUP
+            count.configure(text=f"Players (one per line, 3–5): {k}",
+                            text_color=MUTED if ok or k == 0 else ERR_COLOR)
+        self._update_qualification()
+
+    # ---- qualification -------------------------------------------------------
+    def _update_qualification(self) -> None:
+        n = len(self.group_frames)
+        sizes = [len(self._players(tb)) for _e, _c, tb, _l in self.group_frames]
+        options = Tournament.advance_options(sizes)
+        labels = {f"Top {a} → {ROUND_NAMES[Tournament.bracket_size(n, a)]}": a for a in options}
+        if list(labels) != list(self.advance_choices):
+            previous = self.advance_choices.get(self.advance.get(), 2)
+            self.advance_choices = labels
+            self.advance.configure(values=list(labels))
+            self.advance.set(next((l for l, a in labels.items() if a == previous), next(iter(labels))))
+        if len(options) > 1:
+            self.advance.grid()
+        else:
+            self.advance.grid_remove()
+        adv = self._advance()
+        size = Tournament.bracket_size(n, adv)
+        if n == 1:
+            text = "The top 2 of the group play the Final."
+        else:
+            text = (f"Top {adv} of each group → {ROUND_NAMES[size]} ({size} players)"
+                    + (", then the Final and a 3rd place match." if size >= 4 else "."))
+        if n in (2, 4) and len(options) == 1:
+            text += "\nTop 4 per group is available when every group has exactly 5 players."
+        self.qual_info.configure(text=text)
+
+    def _advance(self) -> int:
+        return self.advance_choices.get(self.advance.get(), 2)
 
     def _create(self) -> None:
-        groups = {e.get().strip(): tb.get("1.0", "end").splitlines() for e, tb, _ in self.group_frames}
-        overrides = {e.get().strip(): self.GROUP_CHOICES[m.get()] for e, _, m in self.group_frames}
+        names = [e.get().strip() for e, _c, _t, _l in self.group_frames]
         try:
-            if len(groups) != len(self.group_frames):
+            if len(set(names)) != len(names):
                 raise TournamentError("Group names must be unique")
-            self.app.ctrl.new_tournament(self.name.get(), groups, self._format(), overrides)
+            groups = {nm: self._players(tb) for nm, (_e, _c, tb, _l) in zip(names, self.group_frames)}
+            formats = {nm: card.get() for nm, (_e, card, _t, _l) in zip(names, self.group_frames)}
+            self.app.ctrl.new_tournament(self.name.get(), groups, formats,
+                                         self.playoff_fmt.get(), self._advance())
             self.error.configure(text="")
         except (TournamentError, ValueError) as e:
             self.error.configure(text=str(e))
@@ -205,7 +279,7 @@ class GroupStageView(ctk.CTkFrame):
             tab.grid_columnconfigure(0, weight=3)
             tab.grid_columnconfigure(1, weight=2)
             tab.grid_rowconfigure(0, weight=1)
-            fmt = g.fmt or t.fmt
+            fmt = g.fmt
             sched = ctk.CTkScrollableFrame(tab, label_text=f"Schedule  ·  {fmt.describe()}")
             sched.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
             for r in g.rounds:
@@ -235,12 +309,13 @@ class GroupStageView(ctk.CTkFrame):
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self.progress_lbl = ctk.CTkLabel(bar, text="")
         self.progress_lbl.pack(side="left", padx=6)
-        self.next_btn = ctk.CTkButton(bar, text="Go to playoffs ▶", command=self._go)
+        first_round = ROUND_NAMES[t.playoff_size]
+        self.next_btn = ctk.CTkButton(bar, text=f"Go to the {first_round} ▶", command=self._go)
         self.next_btn.pack(side="right")
         self.refresh()
 
     def _qualifiers_per_group(self) -> int:
-        return {1: 4, 2: 2, 4: 1}[len(self.app.ctrl.tournament.groups)]
+        return self.app.ctrl.tournament.qualifiers_per_group
 
     def refresh(self) -> None:
         t = self.app.ctrl.tournament
@@ -276,27 +351,38 @@ class GroupStageView(ctk.CTkFrame):
 
 # --------------------------------------------------------------------------- #
 class PlayoffView(ctk.CTkFrame):
+    """Bracket drawn from the knockout's rounds: one column per round, each
+    match centred between the two matches that feed it."""
+
     def __init__(self, master, app: "App"):
         super().__init__(master, fg_color="transparent")
         self.app = app
-        ko = app.ctrl.tournament.knockout
-        board = ctk.CTkFrame(self)
+        t = app.ctrl.tournament
+        ko = t.knockout
+        ctk.CTkLabel(self, text=f"Playoffs · {ko.size} players · {t.playoff_fmt.describe()}",
+                     text_color=MUTED).pack(pady=(6, 0))
+        board = ctk.CTkScrollableFrame(self)
         board.pack(fill="both", expand=True, padx=20, pady=10)
-        for c in range(3):
-            board.grid_columnconfigure(c, weight=1)
-        ctk.CTkLabel(self, text=f"Playoff matches: {app.ctrl.tournament.fmt.describe()}",
-                     text_color=MUTED).pack(before=board, pady=(6, 0))
-        for c, h in enumerate(("Semi-Finals", "Finals", "")):
-            ctk.CTkLabel(board, text=h, font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=c, pady=8)
+        rounds = ko.rounds
+        first = len(rounds[0][1])                     # matches in the first round
         self.rows: dict[str, ScoreRow] = {}
-        layout = {"SF1": (1, 0), "SF2": (3, 0), "F": (1, 1), "3P": (3, 1)}
-        for mid, (r, c) in layout.items():
-            row = ScoreRow(board, app.ctrl, ko.matches[mid], title=Knockout.LABELS[mid])
-            row.grid(row=r, column=c, sticky="ew", padx=16, pady=24)
-            self.rows[mid] = row
-        ctk.CTkLabel(board, text="→", font=ctk.CTkFont(size=30)).grid(row=2, column=0, columnspan=2)
+        for col, (name, ids) in enumerate(rounds):
+            board.grid_columnconfigure(col, weight=1, uniform="round")
+            ctk.CTkLabel(board, text=name, font=ctk.CTkFont(size=16, weight="bold")).grid(
+                row=0, column=col, pady=8)
+            span = first // len(ids)
+            for j, mid in enumerate(ids):
+                row = ScoreRow(board, app.ctrl, ko.matches[mid], title=Knockout.label(mid))
+                row.grid(row=1 + j * span, column=col, rowspan=span, sticky="ew", padx=8, pady=6)
+                self.rows[mid] = row
+        last = len(rounds) - 1
+        if "3P" in ko.matches:
+            row = ScoreRow(board, app.ctrl, ko.matches["3P"], title=Knockout.label("3P"))
+            row.grid(row=1 + first, column=last, sticky="ew", padx=8, pady=(24, 6))
+            self.rows["3P"] = row
+        board.grid_columnconfigure(last + 1, weight=1, uniform="round")
         self.champ = ctk.CTkLabel(board, text="", font=ctk.CTkFont(size=22, weight="bold"), text_color=GOLD)
-        self.champ.grid(row=1, column=2, rowspan=3)
+        self.champ.grid(row=1, column=last + 1, rowspan=first)
         bar = ctk.CTkFrame(self, fg_color="transparent")
         bar.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkButton(bar, text="◀ Back to groups", fg_color="gray40",
@@ -331,9 +417,10 @@ class PodiumView(ctk.CTkFrame):
                      font=ctk.CTkFont(size=28, weight="bold")).pack(pady=(30, 10))
         stage = ctk.CTkFrame(self, fg_color="transparent")
         stage.pack(expand=True)
-        for col, (name, medal, color, h) in enumerate(((runner, "🥈 Runner-up", SILVER, 160),
-                                                         (champ, "🥇 Champion", GOLD, 240),
-                                                         (third, "🥉 3rd place", BRONZE, 110))):
+        places = [(runner, "🥈 Runner-up", SILVER, 160), (champ, "🥇 Champion", GOLD, 240)]
+        if third:                                    # no 3rd-place match when 2 players qualify
+            places.append((third, "🥉 3rd place", BRONZE, 110))
+        for col, (name, medal, color, h) in enumerate(places):
             box = ctk.CTkFrame(stage, fg_color="transparent")
             box.grid(row=0, column=col, padx=10, sticky="s")
             ctk.CTkLabel(box, text=name, font=ctk.CTkFont(size=22 if col == 1 else 18, weight="bold")).pack()

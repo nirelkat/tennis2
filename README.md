@@ -31,18 +31,31 @@ notifies its subscribers, and the active screen re-renders from the model. This 
 structure means any frontend (CLI, web, Qt) can reuse `core` unchanged.
 
 ### User flow
-1. **Setup**: tournament name, 1/2/4 groups (so exactly 4 players reach the playoffs), group names,
-   **3, 4 or 5 players per group** (4 or 5 with a single group), and the match format:
-   **games to win (2, 3 or 6)** and **Enable Tie-Break (Advantage / Deciding Game)**. Each group can
-   keep the tournament format or use its own; the playoffs use the tournament format.
+1. **Setup**: tournament name, 1/2/4 groups, group names and **3, 4 or 5 players per group**.
+   Every group card has its own format card (**Games to win [2] [3] [6]**, **Enable Tie-Break**, and the
+   valid scores underneath). A separate **Playoff Format** card sets the knockout format, and the
+   **Qualification** control shows how many players advance (see below). It updates as you type players.
 2. **Group stage**: one tab per group. The schedule is listed by round, with resting players shown.
    Rounds are played in order: a round unlocks once every score of the previous round is in. Each
    score field turns green or red as you type and explains any error. Press Enter or tab away to
    save. The standings table (#, Player, P, W, L, Games Won, Games Lost, Game Diff) updates live and
-   qualifiers are highlighted. **Go to playoffs** unlocks only when every match has a score.
-3. **Playoffs**: SF1 and SF2 feed the Final and the 3rd-place match automatically. Editing a
-   semi-final clears any dependent result that is no longer valid.
-4. **Podium**: Champion, Runner-up and 3rd place.
+   qualifiers are highlighted. The button to start the playoffs unlocks only when every match has a score.
+3. **Playoffs**: the bracket has one column per round (Round of 16 → Quarter-Finals → Semi-Finals →
+   Final), plus a 3rd place match whenever there are semi-finals. Winners move forward automatically.
+   Changing an earlier result clears every later result that depended on it.
+4. **Podium**: Champion, Runner-up and (when there was a 3rd place match) 3rd place.
+
+### Playoff qualification (`Tournament.advance_options`, `playoff_pairs`)
+| Groups | Group sizes | Advance per group | Bracket |
+|---|---|---|---|
+| 1 | 3–5 | top 2 | **Final** (1 v 2) |
+| 2 | any | top 2 (default) | **Semi-Finals**: A1–B2, B1–A2 → Final + 3rd place |
+| 2 | both exactly 5 | top 4 (option) | **Quarter-Finals**: A1–B4, B2–A3 → SF1; B1–A4, A2–B3 → SF2 |
+| 4 | any | top 2 (default) | **Quarter-Finals**: A1–B2, C1–D2 → SF1; B1–A2, D1–C2 → SF2 |
+| 4 | all exactly 5 | top 4 (option) | **Round of 16**: 1st v 4th and 2nd v 3rd of another group |
+
+Players from the same group are placed in opposite halves of the bracket, so a group's top two can
+only meet in the Final. In the Round of 16, a group's four qualifiers are in four different quarters.
 
 Save (Ctrl+S) or open a tournament as JSON at any point to pause and resume it.
 
@@ -110,8 +123,8 @@ or N rounds (odd N), covers every pair exactly once, and no one plays twice in a
 verified for N = 3, 4, 5.
 
 ### Persistence (`core/persistence.py`)
-Every model has `to_dict`/`from_dict`, and the file includes a `version` field (now 2; files
-from the old best-of-sets format are refused with a clear message). Writes go to a temp file followed by `os.replace` (atomic), so a crash can't corrupt a save.
+Every model has `to_dict`/`from_dict`, and the file includes a `version` field (now 3; files
+saved by older versions are refused with a clear message). Writes go to a temp file followed by `os.replace` (atomic), so a crash can't corrupt a save.
 **SQLite option**: use tables `tournament`, `player`, `group`, `match(id, stage, round, p1, p2, score_json)`.
 Make `persistence` an interface (`Repository.save/load`) with `JsonRepository` and `SqliteRepository`
 implementations so the controller doesn't care which is used. SQLite becomes worthwhile when you want
@@ -124,11 +137,9 @@ history across many tournaments or player statistics.
 - `Group` owns its players, schedule and `standings()`. `Knockout` owns the bracket and its
   winner/loser propagation. `Tournament` validates setup (unique names, group sizes, group count),
   routes commands, and locks the group stage once the playoffs start (it can be reopened explicitly).
-- Seeding: with 1 group it's 1v4 and 2v3. With 2 groups it's A1vB2 and B1vA2, as in the original.
-  With 4 groups the winners play A–D and B–C.
+- `Knockout` is a generic single-elimination bracket for 2, 4, 8 or 16 players: match *j* of a round is
+  fed by the winners of matches *2j-1* and *2j* of the previous round. Seeding is in the table above.
 
 ### Further ideas
-- Larger brackets (8/16 qualifiers) by generalizing `Knockout` into rounds of `Match` nodes, each
-  with `feeds_from` links.
 - Undo/redo with a command stack in the controller.
 - Export standings and the bracket to PDF/CSV, and add a dark/light theme toggle.
