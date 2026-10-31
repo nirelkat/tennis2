@@ -218,11 +218,17 @@ class SetupView(ctk.CTkScrollableFrame):
         self._update_qualification()
 
     # ---- qualification -------------------------------------------------------
+    @staticmethod
+    def _advance_label(n_groups: int, advance: int) -> str:
+        if n_groups == 1 and advance == 2:
+            return "Top 2 → Final"
+        return f"Top {advance} → {ROUND_NAMES[Tournament.bracket_size(n_groups, advance)]}"
+
     def _update_qualification(self) -> None:
         n = len(self.group_frames)
         sizes = [len(self._players(tb)) for _e, _c, tb, _l in self.group_frames]
         options = Tournament.advance_options(sizes)
-        labels = {f"Top {a} → {ROUND_NAMES[Tournament.bracket_size(n, a)]}": a for a in options}
+        labels = {self._advance_label(n, a): a for a in options}
         if list(labels) != list(self.advance_choices):
             previous = self.advance_choices.get(self.advance.get(), 2)
             self.advance_choices = labels
@@ -232,16 +238,31 @@ class SetupView(ctk.CTkScrollableFrame):
             self.advance.grid()
         else:
             self.advance.grid_remove()
-        adv = self._advance()
-        size = Tournament.bracket_size(n, adv)
+        self.qual_info.configure(text=self._qualification_text(n, sizes, self._advance(), options))
+
+    @staticmethod
+    def _qualification_text(n: int, sizes: list[int], adv: int, options: list[int]) -> str:
         if n == 1:
-            text = "The top 2 of the group play the Final."
-        else:
-            text = (f"Top {adv} of each group → {ROUND_NAMES[size]} ({size} players)"
-                    + (", then the Final and a 3rd place match." if size >= 4 else "."))
-        if n in (2, 4) and len(options) == 1:
+            k = sizes[0]
+            if adv == 4:
+                text = ("Semi-Finals: 1st v 4th and 2nd v 3rd. Winners play the Final,\n"
+                        "losers play the 3rd place match.")
+            elif k == 3:
+                text = "1st v 2nd play the Final. The 3rd-placed player in the group takes bronze."
+            elif k in (4, 5):
+                text = "1st v 2nd play the Final; 3rd v 4th play the 3rd place match."
+            else:
+                text = ("1st v 2nd play the Final. With 3 players the 3rd-placed player takes "
+                        "bronze;\nwith 4–5 players 3rd v 4th play the 3rd place match.")
+            if len(options) == 1:
+                text += "\nSemi-Finals (top 4) are available with exactly 5 players."
+            return text
+        size = Tournament.bracket_size(n, adv)
+        text = (f"Top {adv} of each group → {ROUND_NAMES[size]} ({size} players), "
+                "then the Final and a 3rd place match.")
+        if len(options) == 1:
             text += "\nTop 4 per group is available when every group has exactly 5 players."
-        self.qual_info.configure(text=text)
+        return text
 
     def _advance(self) -> int:
         return self.advance_choices.get(self.advance.get(), 2)
@@ -299,6 +320,7 @@ class GroupStageView(ctk.CTkFrame):
                 tv.column(c, width=140 if c == "player" else (85 if c.startswith("g") else 45),
                           anchor="w" if c == "player" else "center")
             tv.tag_configure("q", background="#1f6aa5", foreground="white")
+            tv.tag_configure("b", background="#8c5a2b", foreground="white")   # plays for / gets bronze
             tv.pack(fill="both", expand=True, padx=8, pady=(0, 8))
             tv.group = g
             self.tables.append(tv)
@@ -329,12 +351,13 @@ class GroupStageView(ctk.CTkFrame):
                 text += f"   🔒 enter all round {g.current_round} scores first"
             lbl.configure(text=text, text_color=MUTED if "🔒" in text else ("gray10", "gray90"))
         q = self._qualifiers_per_group()
+        bronze = t.bronze_ranks
         for tv in self.tables:
             tv.delete(*tv.get_children())
             for r in tv.group.standings():
                 tv.insert("", "end", values=(r.rank, r.name, r.played, r.wins, r.losses,
                                              r.games_won, r.games_lost, f"{r.game_diff:+d}"),
-                          tags=("q",) if r.rank <= q else ())
+                          tags=("q",) if r.rank <= q else ("b",) if r.rank in bronze else ())
         ms = [m for g in t.groups for m in g.matches]
         done = sum(m.is_played for m in ms)
         self.progress.set(done / len(ms))
@@ -359,7 +382,7 @@ class PlayoffView(ctk.CTkFrame):
         self.app = app
         t = app.ctrl.tournament
         ko = t.knockout
-        ctk.CTkLabel(self, text=f"Playoffs · {ko.size} players · {t.playoff_fmt.describe()}",
+        ctk.CTkLabel(self, text=f"Playoffs · {len(ko.participants)} players · {t.playoff_fmt.describe()}",
                      text_color=MUTED).pack(pady=(6, 0))
         board = ctk.CTkScrollableFrame(self)
         board.pack(fill="both", expand=True, padx=20, pady=10)
@@ -380,6 +403,10 @@ class PlayoffView(ctk.CTkFrame):
             row = ScoreRow(board, app.ctrl, ko.matches["3P"], title=Knockout.label("3P"))
             row.grid(row=1 + first, column=last, sticky="ew", padx=8, pady=(24, 6))
             self.rows["3P"] = row
+        elif ko.bronze:                                 # single group of 3
+            ctk.CTkLabel(board, text=f"🥉 3rd place: {ko.bronze}\n(3rd in the group stage)",
+                         text_color=BRONZE, font=ctk.CTkFont(size=14, weight="bold")).grid(
+                row=1 + first, column=last, padx=8, pady=(24, 6))
         board.grid_columnconfigure(last + 1, weight=1, uniform="round")
         self.champ = ctk.CTkLabel(board, text="", font=ctk.CTkFont(size=22, weight="bold"), text_color=GOLD)
         self.champ.grid(row=1, column=last + 1, rowspan=first)
@@ -412,14 +439,16 @@ class PlayoffView(ctk.CTkFrame):
 class PodiumView(ctk.CTkFrame):
     def __init__(self, master, app: "App"):
         super().__init__(master, fg_color="transparent")
-        champ, runner, third = app.ctrl.tournament.knockout.podium
+        ko = app.ctrl.tournament.knockout
+        champ, runner, third = ko.podium
         ctk.CTkLabel(self, text=f"🎉 {app.ctrl.tournament.name} 🎉",
                      font=ctk.CTkFont(size=28, weight="bold")).pack(pady=(30, 10))
         stage = ctk.CTkFrame(self, fg_color="transparent")
         stage.pack(expand=True)
         places = [(runner, "🥈 Runner-up", SILVER, 160), (champ, "🥇 Champion", GOLD, 240)]
-        if third:                                    # no 3rd-place match when 2 players qualify
-            places.append((third, "🥉 3rd place", BRONZE, 110))
+        if third:
+            medal = "🥉 3rd place\n(group stage)" if ko.bronze else "🥉 3rd place"
+            places.append((third, medal, BRONZE, 110))
         for col, (name, medal, color, h) in enumerate(places):
             box = ctk.CTkFrame(stage, fg_color="transparent")
             box.grid(row=0, column=col, padx=10, sticky="s")

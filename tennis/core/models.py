@@ -121,11 +121,17 @@ BRACKET_SIZES = (2, 4, 8, 16)
 class Knockout:
     """Single-elimination bracket for 2, 4, 8 or 16 players.
 
-    Match ids: R16-1..8, QF1..4, SF1..2, F, and 3P (3rd place, when there are
-    semi-finals). Match j of a round is fed by the winners of matches 2j-1 and
-    2j of the previous round; the 3rd-place match by the semi-final losers."""
+    Match ids: R16-1..8, QF1..4, SF1..2, F, and 3P (3rd place). Match j of a
+    round is fed by the winners of matches 2j-1 and 2j of the previous round;
+    with semi-finals, the 3rd-place match is played by the semi-final losers.
+
+    Single group, Final only (size 2):
+      * 4-5 players: the 3rd-place match is seeded directly (3rd v 4th).
+      * 3 players: no 3rd-place match; `bronze` holds the group's 3rd-placed
+        player, who takes 3rd place on the podium."""
     size: int
     matches: dict[str, Match]
+    bronze: str | None = None
 
     @staticmethod
     def round_ids(size: int) -> list[list[str]]:
@@ -138,7 +144,11 @@ class Knockout:
         return out
 
     @classmethod
-    def create(cls, pairs: list[tuple[str, str]]) -> "Knockout":
+    def create(cls, pairs: list[tuple[str, str]],
+               third_place: tuple[str, str] | None = None,
+               bronze: str | None = None) -> "Knockout":
+        """pairs: first-round pairs in bracket order. third_place / bronze are
+        only used for a Final-only bracket (see class docstring)."""
         size = 2 * len(pairs)
         if size not in BRACKET_SIZES:
             raise TournamentError(f"Unsupported bracket size {size}")
@@ -149,7 +159,17 @@ class Knockout:
                 matches[mid] = Match(mid, p1, p2, r)
         if size >= 4:
             matches["3P"] = Match("3P", None, None, matches["F"].round)
-        return cls(size, matches)
+        elif third_place:
+            matches["3P"] = Match("3P", *third_place, matches["F"].round)
+        return cls(size, matches, None if third_place else bronze)
+
+    @property
+    def participants(self) -> list[str]:
+        """Everyone who starts the playoffs (first round + a seeded 3rd-place match)."""
+        first = [self.matches[mid] for mid in self.round_ids(self.size)[0]]
+        if self.size == 2 and "3P" in self.matches:
+            first.append(self.matches["3P"])
+        return [p for m in first for p in (m.p1, m.p2) if p]
 
     @property
     def rounds(self) -> list[tuple[str, list[str]]]:
@@ -174,7 +194,7 @@ class Knockout:
             for j, mid in enumerate(cur):
                 a, b = self.matches[prev[2 * j]], self.matches[prev[2 * j + 1]]
                 self._set_players(self.matches[mid], a.winner, b.winner)
-        if "3P" in self.matches:
+        if "3P" in self.matches and "SF1" in self.matches:   # seeded 3P stays as is
             sf1, sf2 = self.matches["SF1"], self.matches["SF2"]
             self._set_players(self.matches["3P"], sf1.loser, sf2.loser)
 
@@ -189,18 +209,21 @@ class Knockout:
 
     @property
     def podium(self) -> tuple[str, str, str | None] | None:
-        """(champion, runner-up, 3rd place or None when there is no 3rd-place match)."""
+        """(champion, runner-up, 3rd place). 3rd place is the 3rd-place match
+        winner, or the group's 3rd-placed player when there is no such match."""
         if not self.is_complete:
             return None
         f, t = self.matches["F"], self.matches.get("3P")
-        return f.winner, f.loser, (t.winner if t else None)
+        return f.winner, f.loser, (t.winner if t else self.bronze)
 
     def to_dict(self) -> dict:
-        return {"size": self.size, "matches": [m.to_dict() for m in self.matches.values()]}
+        return {"size": self.size, "bronze": self.bronze,
+                "matches": [m.to_dict() for m in self.matches.values()]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Knockout":
-        return cls(d["size"], {m["id"]: Match.from_dict(m) for m in d["matches"]})
+        return cls(d["size"], {m["id"]: Match.from_dict(m) for m in d["matches"]},
+                   d.get("bronze"))
 
 
 def playoff_pairs(standings: list[list[str]], advance: int) -> list[tuple[str, str]]:
@@ -211,9 +234,11 @@ def playoff_pairs(standings: list[list[str]], advance: int) -> list[tuple[str, s
     the next round, 3+4, ...), arranged so players from the same group are in
     different halves and only meet as late as possible."""
     n = len(standings)
-    if n == 1:                                   # top 2 -> Final
+    if n == 1:
         g = standings[0]
-        return [(g[0], g[1])]
+        if advance == 4:                         # Semi-Finals: 1v4, 2v3
+            return [(g[0], g[3]), (g[1], g[2])]
+        return [(g[0], g[1])]                    # Final: 1v2
     A, B = standings[0], standings[1]
     if n == 2 and advance == 2:                  # Semi-Finals
         return [(A[0], B[1]), (B[0], A[1])]
@@ -243,15 +268,16 @@ class Tournament:
 
     @staticmethod
     def advance_options(group_sizes: list[int]) -> list[int]:
-        """Allowed players-per-group to qualify. Top 4 is only offered when
-        there are 2 or 4 groups and every group has exactly 5 players."""
-        if len(group_sizes) in (2, 4) and all(n == 5 for n in group_sizes):
+        """Allowed players-per-group to qualify (2 is always the default).
+        Top 4 is only offered when every group has exactly 5 players:
+        1 group -> Semi-Finals, 2 groups -> Quarter-Finals, 4 groups -> Round of 16."""
+        if group_sizes and all(n == 5 for n in group_sizes):
             return [2, 4]
         return [2]
 
     @staticmethod
     def bracket_size(n_groups: int, advance: int) -> int:
-        return 2 if n_groups == 1 else n_groups * advance
+        return n_groups * advance
 
     @classmethod
     def create(cls, name: str, groups: dict[str, list[str]],
@@ -277,13 +303,21 @@ class Tournament:
             built.append(Group.create(gname.strip(), players, string.ascii_uppercase[i],
                                       group_formats.get(gname) or MatchFormat()))
         if advance not in cls.advance_options([len(g.players) for g in built]):
-            raise TournamentError("Top 4 per group can only advance with 2 or 4 groups "
-                                  "of exactly 5 players each")
+            raise TournamentError("Top 4 per group can only advance when every group "
+                                  "has exactly 5 players")
         return cls(name or "Tournament", playoff_fmt or MatchFormat(), built, advance)
 
     @property
     def qualifiers_per_group(self) -> int:
         return self.advance
+
+    @property
+    def bronze_ranks(self) -> list[int]:
+        """Group ranks that play for (or receive) 3rd place without reaching the
+        Final bracket: single group, Final only -> 3rd v 4th, or 3rd with 3 players."""
+        if len(self.groups) == 1 and self.advance == 2:
+            return [3, 4] if len(self.groups[0].players) >= 4 else [3]
+        return []
 
     @property
     def playoff_size(self) -> int:
@@ -350,7 +384,15 @@ class Tournament:
         if not self.group_stage_complete:
             raise TournamentError("Finish all group matches first")
         if self.knockout is None:
-            self.knockout = Knockout.create(self.playoff_seeds())
+            third_place, bronze = None, None
+            ranks = self.bronze_ranks
+            if ranks:
+                order = [r.name for r in self.groups[0].standings()]
+                if len(ranks) == 2:
+                    third_place = (order[2], order[3])     # 3rd v 4th
+                else:
+                    bronze = order[2]                      # 3 players: bronze by ranking
+            self.knockout = Knockout.create(self.playoff_seeds(), third_place, bronze)
         return self.knockout
 
     def reopen_group_stage(self) -> None:

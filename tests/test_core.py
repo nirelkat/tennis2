@@ -275,14 +275,17 @@ def ranked(*prefixes, n=5):
 class QualificationTests(unittest.TestCase):
     def test_advance_options(self):
         opts = Tournament.advance_options
-        self.assertEqual(opts([5]), [2])                     # 1 group: always the Final
+        self.assertEqual(opts([3]), [2])                     # 1 group: Final
+        self.assertEqual(opts([4]), [2])
+        self.assertEqual(opts([5]), [2, 4])                  # 1 group of 5: Final or SFs
         self.assertEqual(opts([5, 5]), [2, 4])
         self.assertEqual(opts([5, 4]), [2])
         self.assertEqual(opts([5, 5, 5, 5]), [2, 4])
         self.assertEqual(opts([5, 5, 5, 3]), [2])
 
     def test_top4_only_with_all_groups_of_five(self):
-        for groups in ({"A": players("a", 5)},
+        for groups in ({"A": players("a", 3)},
+                       {"A": players("a", 4)},
                        {"A": players("a", 5), "B": players("b", 4)},
                        {g: players(g.lower(), 5 if g != "D" else 4) for g in "ABCD"}):
             with self.subTest(groups=groups), self.assertRaises(TournamentError):
@@ -311,7 +314,9 @@ class QualificationTests(unittest.TestCase):
     def test_bracket_shapes(self):
         cases = [  # groups, advance, size, round names
             ({"A": players("a", 3)}, 2, 2, ["Final"]),
+            ({"A": players("a", 4)}, 2, 2, ["Final"]),
             ({"A": players("a", 5)}, 2, 2, ["Final"]),
+            ({"A": players("a", 5)}, 4, 4, ["Semi-Finals", "Final"]),
             ({"A": players("a", 4), "B": players("b", 3)}, 2, 4, ["Semi-Finals", "Final"]),
             ({"A": players("a", 5), "B": players("b", 5)}, 2, 4, ["Semi-Finals", "Final"]),
             ({"A": players("a", 5), "B": players("b", 5)}, 4, 8,
@@ -332,14 +337,14 @@ class QualificationTests(unittest.TestCase):
                 first = ko.rounds[0][1]
                 self.assertEqual(len(first), size // 2)
                 self.assertTrue(all(ko.matches[m].is_ready for m in first))
-                self.assertEqual("3P" in ko.matches, size >= 4)
+                three_player_group = len(groups) == 1 and len(t.groups[0].players) == 3
+                self.assertEqual("3P" in ko.matches, not three_player_group)
                 play_bracket(t)
                 champ, runner, third = ko.podium
                 self.assertEqual(champ, ko.matches["F"].winner)
-                if size == 2:
-                    self.assertIsNone(third)
-                    standings = [r.name for r in t.groups[0].standings()]
-                    self.assertEqual({champ, runner}, set(standings[:2]))
+                self.assertEqual(runner, ko.matches["F"].loser)
+                if three_player_group:
+                    self.assertEqual(third, t.groups[0].standings()[2].name)
                 else:
                     self.assertEqual(third, ko.matches["3P"].winner)
 
@@ -370,6 +375,78 @@ class QualificationTests(unittest.TestCase):
         d = t.to_dict()
         self.assertEqual(Tournament.from_dict(d).to_dict(), d)
         self.assertEqual(Tournament.from_dict(d).knockout.size, 8)
+
+
+class SingleGroupTests(unittest.TestCase):
+    """1 group: 3 players -> Final + bronze by ranking; 4 players -> Final +
+    3rd v 4th; 5 players -> that (default) or Semi-Finals 1v4, 2v3."""
+
+    def start(self, n, advance=2):
+        t = make({"G": players("p", n)}, advance=advance)
+        play_groups(t)                        # player 1 of every match wins
+        order = [r.name for r in t.groups[0].standings()]
+        return t, t.start_playoffs(), order
+
+    def test_three_players_final_and_bronze_from_group(self):
+        t, ko, order = self.start(3)
+        self.assertEqual(list(ko.matches), ["F"])
+        self.assertEqual((ko.matches["F"].p1, ko.matches["F"].p2), (order[0], order[1]))
+        self.assertEqual(ko.bronze, order[2])
+        self.assertEqual(t.bronze_ranks, [3])
+        self.assertIsNone(ko.podium)
+        t.record_score("F", "1-6")             # 2nd beats 1st
+        self.assertEqual(ko.podium, (order[1], order[0], order[2]))
+        with self.assertRaises(TournamentError):
+            make({"G": players("p", 3)}, advance=4)
+
+    def test_four_players_final_and_third_place_match(self):
+        t, ko, order = self.start(4)
+        self.assertEqual(sorted(ko.matches), ["3P", "F"])
+        f, tp = ko.matches["F"], ko.matches["3P"]
+        self.assertEqual((f.p1, f.p2), (order[0], order[1]))
+        self.assertEqual((tp.p1, tp.p2), (order[2], order[3]))
+        self.assertIsNone(ko.bronze)
+        self.assertEqual(sorted(ko.participants), sorted(order))
+        self.assertEqual(t.bronze_ranks, [3, 4])
+        t.record_score("3P", "2-6")            # 4th beats 3rd
+        t.record_score("F", "6-2")
+        self.assertEqual(ko.podium, (order[0], order[1], order[3]))
+        t.record_score("F", "2-6")             # editing the Final keeps the 3P result
+        self.assertIsNotNone(tp.score)
+        self.assertEqual(ko.podium, (order[1], order[0], order[3]))
+        with self.assertRaises(TournamentError):
+            make({"G": players("p", 4)}, advance=4)
+
+    def test_five_players_default_is_final_plus_third_place(self):
+        t, ko, order = self.start(5)
+        self.assertEqual(ko.size, 2)
+        self.assertEqual((ko.matches["F"].p1, ko.matches["F"].p2), (order[0], order[1]))
+        self.assertEqual((ko.matches["3P"].p1, ko.matches["3P"].p2), (order[2], order[3]))
+        self.assertNotIn(order[4], ko.participants)
+
+    def test_five_players_semi_finals_option(self):
+        t, ko, order = self.start(5, advance=4)
+        self.assertEqual(t.bronze_ranks, [])
+        sf1, sf2 = ko.matches["SF1"], ko.matches["SF2"]
+        self.assertEqual((sf1.p1, sf1.p2), (order[0], order[3]))    # 1st v 4th
+        self.assertEqual((sf2.p1, sf2.p2), (order[1], order[2]))    # 2nd v 3rd
+        self.assertFalse(ko.matches["3P"].is_ready)
+        t.record_score("SF1", "2-6")
+        t.record_score("SF2", "6-2")
+        self.assertEqual((ko.matches["F"].p1, ko.matches["F"].p2), (order[3], order[1]))
+        self.assertEqual((ko.matches["3P"].p1, ko.matches["3P"].p2), (order[0], order[2]))
+        t.record_score("F", "6-3")
+        t.record_score("3P", "6-3")
+        self.assertEqual(ko.podium, (order[3], order[1], order[0]))
+
+    def test_single_group_brackets_persist(self):
+        for n, adv in ((3, 2), (4, 2), (5, 4)):
+            with self.subTest(n=n, advance=adv):
+                t, ko, _ = self.start(n, adv)
+                d = t.to_dict()
+                t2 = Tournament.from_dict(d)
+                self.assertEqual(t2.to_dict(), d)
+                self.assertEqual(t2.knockout.bronze, ko.bronze)
 
 
 if __name__ == "__main__":

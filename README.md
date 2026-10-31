@@ -41,14 +41,18 @@ structure means any frontend (CLI, web, Qt) can reuse `core` unchanged.
    save. The standings table (#, Player, P, W, L, Games Won, Games Lost, Game Diff) updates live and
    qualifiers are highlighted. The button to start the playoffs unlocks only when every match has a score.
 3. **Playoffs**: the bracket has one column per round (Round of 16 → Quarter-Finals → Semi-Finals →
-   Final), plus a 3rd place match whenever there are semi-finals. Winners move forward automatically.
+   Final), plus a 3rd place match (fed by the semi-final losers, or 3rd v 4th of a single group). Winners move forward automatically.
    Changing an earlier result clears every later result that depended on it.
-4. **Podium**: Champion, Runner-up and (when there was a 3rd place match) 3rd place.
+4. **Podium**: Champion, Runner-up and 3rd place (the 3rd place match winner, or the group's
+   3rd-placed player in a single group of 3).
 
 ### Playoff qualification (`Tournament.advance_options`, `playoff_pairs`)
 | Groups | Group sizes | Advance per group | Bracket |
 |---|---|---|---|
-| 1 | 3–5 | top 2 | **Final** (1 v 2) |
+| 1 | 3 | top 2 | **Final** (1st v 2nd); the 3rd-placed player in the group takes bronze |
+| 1 | 4 | top 2 | **Final** (1st v 2nd) + **3rd place match** (3rd v 4th) |
+| 1 | 5 | top 2 (default) | **Final** (1st v 2nd) + **3rd place match** (3rd v 4th) |
+| 1 | 5 | top 4 (option) | **Semi-Finals**: 1st v 4th, 2nd v 3rd → Final + 3rd place |
 | 2 | any | top 2 (default) | **Semi-Finals**: A1–B2, B1–A2 → Final + 3rd place |
 | 2 | both exactly 5 | top 4 (option) | **Quarter-Finals**: A1–B4, B2–A3 → SF1; B1–A4, A2–B3 → SF2 |
 | 4 | any | top 2 (default) | **Quarter-Finals**: A1–B2, C1–D2 → SF1; B1–A2, D1–C2 → SF2 |
