@@ -20,8 +20,9 @@ class TournamentController:
             fn()
 
     # commands -------------------------------------------------------------
-    def new_tournament(self, name: str, groups: dict[str, list[str]], fmt: MatchFormat) -> None:
-        self.tournament = Tournament.create(name, groups, fmt)
+    def new_tournament(self, name: str, groups: dict[str, list[str]], fmt: MatchFormat,
+                       group_formats: dict[str, MatchFormat | None] | None = None) -> None:
+        self.tournament = Tournament.create(name, groups, fmt, group_formats)
         self._notify()
 
     def record_score(self, match_id: str, text: str) -> None:
